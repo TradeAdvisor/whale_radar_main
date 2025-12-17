@@ -367,6 +367,9 @@ struct Row {
     // reliability fields
     reliability_score: f64,
     reliability_label: String,
+
+    // news sentiment field
+    news_sentiment: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -444,7 +447,6 @@ struct TopRow {
     whale_pred_score: f64,
     whale_pred_label: String,
 
-    // reliability fields
     reliability_score: f64,
     reliability_label: String,
 
@@ -601,6 +603,7 @@ trades: Arc<DashMap<String, TradeState>>,
     weights: Arc<Mutex<ScoreWeights>>,
 
     trader: Arc<Mutex<TraderState>>, 
+    news_sentiment: Arc<DashMap<String, (f64, i64, String)>>,
 }
 
 impl Engine {
@@ -614,6 +617,7 @@ impl Engine {
             signalled_pairs: Arc::new(DashMap::new()),
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
             trader: Arc::new(Mutex::new(TraderState::new())),
+            news_sentiment: Arc::new(DashMap::new()),
         }
     }
 
@@ -633,7 +637,9 @@ impl Engine {
     }
 
     // NIEUW: update_sentiment functie voor nieuws-integratie (stap 1)
-    fn update_sentiment(&self, pair: &str, sentiment: f64) {
+    fn update_sentiment(&self, pair: &str, sentiment: f64, title: &str) {
+        self.news_sentiment.insert(pair.to_string(), (sentiment, Utc::now().timestamp(), title.to_string()));
+        // Optioneel: Boost scores in trades als de pair bestaat
         if let Some(mut ts) = self.trades.get_mut(pair) {
             ts.news_sentiment = sentiment;
             ts.last_update_ts = Utc::now().timestamp();  // FIX: Update timestamp zodat UI echte data toont
@@ -1578,7 +1584,7 @@ fn snapshot(&self) -> Vec<Row> {
                         let (reliability_score, reliability_label) = Self::compute_reliability(&v, now_ts);
 
             rows.push(Row {
-                pair,
+                pair: pair.clone(),
                 price: cl,
                 pct,
                 whale: has_whale,
@@ -1607,6 +1613,7 @@ fn snapshot(&self) -> Vec<Row> {
                 whale_pred_label,
                 reliability_score,
                 reliability_label,
+                news_sentiment: self.news_sentiment.get(&pair).map(|v| v.0).unwrap_or(0.5),
             });
         }
 
@@ -1919,6 +1926,13 @@ fn snapshot(&self) -> Vec<Row> {
             parts.push("Alpha BUY signaal: sterke combinatie van factoren.".to_string());
         } else if row.early == "BUY" {
             parts.push("Vroege koopindicatie.".to_string());
+        }
+
+        // Nieuws sentiment
+        if row.news_sentiment > 0.7 {
+            parts.push(format!("Positieve nieuws sentiment ({:.1}).", row.news_sentiment));
+        } else if row.news_sentiment < 0.3 {
+            parts.push(format!("Negatieve nieuws sentiment ({:.1}).", row.news_sentiment));
         }
 
         // Als geen specifieke info, algemene opmerking
@@ -2450,7 +2464,7 @@ tr:nth-child(even){ background:#252525; }
       <label>Heatmap Min Radius (4.0-10.0):</label>
       <input type="number" step="0.5" min="4.0" max="10.0" id="heatmap_min_radius" /><br/>
       <label>Heatmap Max Radius (10.0-20.0):</label>
-      <input type="number" step="0.5" min="10.0" max="20.0" id="heatmap_max_radius" /><br/>
+      <input type="number" step="0.5" min="10.0" max="10.0" id="heatmap_max_radius" /><br/>
       <label>Chart Refresh Rate (0.5-5.0):</label>
       <input type="number" step="0.5" min="0.5" max="5.0" id="chart_refresh_rate_sec" /><br/>
 
@@ -3163,19 +3177,19 @@ async function loadStars() {
 
 async function loadNews() {
   let includeStable = document.getElementById("news-stable-filter").checked;
-  fetch("/api/stats")
+  fetch("/api/news")
     .then(r => r.json())
     .then(data => {
       let tbody = document.querySelector("#news-table tbody");
       tbody.innerHTML = "";
       for (let r of data.filter(row => includeStable || !isStablecoin(row.pair))) {
-        let sentiment = r.news_sentiment || 0.5;
+        let sentiment = r.sentiment || 0.5;
         let classSent = sentiment > 0.7 ? "pos" : (sentiment < 0.3 ? "neg" : "");
         tbody.innerHTML += `<tr>
           <td>${r.pair}</td>
           <td class="${classSent}">${sentiment.toFixed(2)}</td>
-          <td>${new Date(r.last_update_ts * 1000).toLocaleString()}</td>
-          <td>N/A</td>
+          <td>${new Date(r.last_update * 1000).toLocaleString()}</td>
+          <td>${r.articles}</td>
         </tr>`;
       }
     })
@@ -3330,6 +3344,8 @@ function tick() {
     loadPaperTrading();
   } else if (activeTab === "backtest") {
     loadBacktest();
+  } else if (activeTab === "news") {
+    loadNews();
   }
 }
 
@@ -3657,7 +3673,7 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
 
     loop {
         // Voorbeeld: RSS feed van een crypto nieuws site (bijv. CoinDesk)
-        let rss_url = "https://www.coindesk.com/arc/outboundfeeds/rss/";
+        let rss_url = "https://cointelegraph.com/rss";
 
         if let Ok(resp) = reqwest::get(rss_url).await {
             if let Ok(content) = resp.text().await {
@@ -3665,8 +3681,8 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
                     for item in channel.items {
                         if let Some(title) = item.title {
                             // Eenvoudige sentiment analyse: tel positieve/negatieve woorden
-                            let positive_words = vec!["bull", "rally", "surge", "pump", "rise", "green", "up", "buy"];
-                            let negative_words = vec!["bear", "crash", "dump", "fall", "red", "down", "sell", "drop"];
+                            let positive_words = vec!["bull", "rally", "surge", "pump", "rise", "green", "up", "buy", "bullish", "gains", "soars"];
+                            let negative_words = vec!["bear", "crash", "dump", "fall", "red", "down", "sell", "drop", "bearish", "losses", "plunges"];
 
                             let title_lower = title.to_lowercase();
                             let pos_count: usize = positive_words.iter().map(|w| title_lower.matches(w).count()).sum();
@@ -3680,8 +3696,11 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
 
                             // Extract pair van title (bijv. "BTC" of "Bitcoin")
                             if let Some(pair) = extract_pair_from_title(&title) {
-                                engine.update_sentiment(&pair, sentiment);
+                                engine.update_sentiment(&pair, sentiment, &title);
                                 println!("[NEWS] {} sentiment {:.2} for {}", title, sentiment, pair);
+                            } else {
+                                engine.update_sentiment("BTC/EUR", sentiment, &title);
+                                println!("[NEWS] {} sentiment {:.2} for BTC/EUR (general)", title, sentiment);
                             }
                         }
                     }
@@ -3689,8 +3708,8 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
             }
         }
 
-        // Wacht 10 minuten voor volgende scan
-        sleep(Duration::from_secs(600)).await;
+        // Wacht 1 minuut voor volgende scan
+        sleep(Duration::from_secs(60)).await;
     }
 }
 
@@ -3698,14 +3717,20 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
 fn extract_pair_from_title(title: &str) -> Option<String> {
     let title_lower = title.to_lowercase();
     let pairs = vec![
-        ("bitcoin", "BTC/EUR"),
-        ("btc", "BTC/EUR"),
-        ("ethereum", "ETH/EUR"),
-        ("eth", "ETH/EUR"),
-        ("xrp", "XRP/EUR"),
-        ("ripple", "XRP/EUR"),
-        ("doge", "DOGE/EUR"),
-        ("dogecoin", "DOGE/EUR"),
+        ("bitcoin", "BTC/EUR"), ("btc", "BTC/EUR"),
+        ("ethereum", "ETH/EUR"), ("eth", "ETH/EUR"),
+        ("xrp", "XRP/EUR"), ("ripple", "XRP/EUR"),
+        ("solana", "SOL/EUR"), ("sol", "SOL/EUR"),
+        ("cardano", "ADA/EUR"), ("ada", "ADA/EUR"),
+        ("dogecoin", "DOGE/EUR"), ("doge", "DOGE/EUR"),
+        ("polkadot", "DOT/EUR"), ("dot", "DOT/EUR"),
+        ("chainlink", "LINK/EUR"), ("link", "LINK/EUR"),
+        ("polygon", "MATIC/EUR"), ("matic", "MATIC/EUR"),
+        ("avalanche", "AVAX/EUR"), ("avax", "AVAX/EUR"),
+        ("binance", "BNB/EUR"), ("bnb", "BNB/EUR"),
+        ("litecoin", "LTC/EUR"), ("ltc", "LTC/EUR"),
+        ("uniswap", "UNI/EUR"), ("uni", "UNI/EUR"),
+        ("shiba", "SHIB/EUR"), ("shib", "SHIB/EUR"),
     ];
 
     for (keyword, pair) in pairs {
@@ -3937,13 +3962,17 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
         .and(engine_filter.clone())
         .map(|engine: Engine| {
             let mut news_data = Vec::new();
-            for t in engine.trades.iter() {
-                let pair = t.key().clone();
-                let ts = t.value();
+            for ns in engine.news_sentiment.iter() {
+                let pair = ns.key().clone();
+                let value = ns.value();
+                let sentiment = value.0;
+                let last_update = value.1;
+                let title = value.2.clone();
                 news_data.push(serde_json::json!({
                     "pair": pair,
-                    "sentiment": ts.news_sentiment,
-                    "last_update": ts.last_update_ts
+                    "sentiment": sentiment,
+                    "last_update": last_update,
+                    "articles": title
                 }));
             }
             warp::reply::json(&news_data)
@@ -4093,4 +4122,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
