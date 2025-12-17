@@ -29,6 +29,7 @@
 use chrono::Utc;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use lazy_static::lazy_static;
 use reqwest;
 use rss::Channel;
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,27 @@ use tokio::time::{sleep, Duration};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use warp::Filter;
+
+// ============================================================================
+// LAZY STATIC INITIALIZATION
+// ============================================================================
+
+lazy_static! {
+    static ref KEYWORD_MAP: HashMap<String, String> = {
+        let json_str = include_str!("pair_keywords.json");
+        serde_json::from_str(json_str).expect("Failed to parse pair_keywords.json: ensure valid JSON format with string key-value pairs")
+    };
+    
+    // Pre-sorted keywords by length (descending) for efficient matching
+    static ref SORTED_KEYWORDS: Vec<(String, String)> = {
+        let mut keywords: Vec<(String, String)> = KEYWORD_MAP
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        keywords.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        keywords
+    };
+}
 
 // ============================================================================
 // HOOFDSTUK 1 – CONFIGURATIE & CONSTANTES
@@ -3716,26 +3738,11 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
 // NIEUW: Helper functie om pair uit title te extraheren
 fn extract_pair_from_title(title: &str) -> Option<String> {
     let title_lower = title.to_lowercase();
-    let pairs = vec![
-        ("bitcoin", "BTC/EUR"), ("btc", "BTC/EUR"),
-        ("ethereum", "ETH/EUR"), ("eth", "ETH/EUR"),
-        ("xrp", "XRP/EUR"), ("ripple", "XRP/EUR"),
-        ("solana", "SOL/EUR"), ("sol", "SOL/EUR"),
-        ("cardano", "ADA/EUR"), ("ada", "ADA/EUR"),
-        ("dogecoin", "DOGE/EUR"), ("doge", "DOGE/EUR"),
-        ("polkadot", "DOT/EUR"), ("dot", "DOT/EUR"),
-        ("chainlink", "LINK/EUR"), ("link", "LINK/EUR"),
-        ("polygon", "MATIC/EUR"), ("matic", "MATIC/EUR"),
-        ("avalanche", "AVAX/EUR"), ("avax", "AVAX/EUR"),
-        ("binance", "BNB/EUR"), ("bnb", "BNB/EUR"),
-        ("litecoin", "LTC/EUR"), ("ltc", "LTC/EUR"),
-        ("uniswap", "UNI/EUR"), ("uni", "UNI/EUR"),
-        ("shiba", "SHIB/EUR"), ("shib", "SHIB/EUR"),
-    ];
 
-    for (keyword, pair) in pairs {
+    // Use pre-sorted keywords to check more specific keywords first
+    for (keyword, pair) in SORTED_KEYWORDS.iter() {
         if title_lower.contains(keyword) {
-            return Some(pair.to_string());
+            return Some(pair.clone());
         }
     }
     None
