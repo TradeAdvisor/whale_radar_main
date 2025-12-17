@@ -256,7 +256,7 @@ async fn save_signal_stats(map: &HashMap<String, SignalStats>) {
 // 3.3 TickerState  – REST ticker & anomaly info
 
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TradeState {
     buy_volume: f64,
     sell_volume: f64,
@@ -302,6 +302,42 @@ struct TradeState {
     news_sentiment: f64,  // 0.0 = negatief, 1.0 = positief, default 0.5
 }
 
+impl Default for TradeState {
+    fn default() -> Self {
+        Self {
+            buy_volume: 0.0,
+            sell_volume: 0.0,
+            trade_count: 0,
+            ewma_trade_size: None,
+            ewma_notional: None,
+            ewma_volume: None,
+            last_whale: false,
+            last_whale_side: None,
+            last_whale_volume: None,
+            last_whale_notional: None,
+            last_early: None,
+            last_alpha: None,
+            last_score: 0.0,
+            last_rating: None,
+            last_flow_pct: 0.0,
+            last_dir: "".to_string(),
+            recent_buys: Vec::new(),
+            recent_sells: Vec::new(),
+            recent_buys_5m: Vec::new(),
+            recent_sells_5m: Vec::new(),
+            last_flow_pct_5m: 0.0,
+            last_dir_5m: "".to_string(),
+            recent_prices: Vec::new(),
+            last_pump_score: 0.0,
+            last_pump_signal: None,
+            whale_pred_score: 0.0,
+            whale_pred_label: None,
+            last_update_ts: 0,
+            news_sentiment: 0.5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CandleState {
     open: Option<f64>,
@@ -333,15 +369,6 @@ struct OrderbookState {
     bids: Vec<(f64, f64)>,  // (price, volume)
     asks: Vec<(f64, f64)>,  // (price, volume)
     timestamp: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct NewsArticle {
-    title: String,
-    pair: String,
-    sentiment: f64,
-    timestamp: i64,
-    source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -376,6 +403,10 @@ struct Row {
     // reliability fields
     reliability_score: f64,
     reliability_label: String,
+
+    // news fields
+    news_sentiment: f64,
+    last_update_ts: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -609,8 +640,7 @@ trades: Arc<DashMap<String, TradeState>>,
     signalled_pairs: Arc<DashMap<String, bool>>,
     weights: Arc<Mutex<ScoreWeights>>,
 
-    trader: Arc<Mutex<TraderState>>,
-    news_articles: Arc<Mutex<Vec<NewsArticle>>>,
+    trader: Arc<Mutex<TraderState>>, 
 }
 
 impl Engine {
@@ -624,7 +654,6 @@ impl Engine {
             signalled_pairs: Arc::new(DashMap::new()),
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
             trader: Arc::new(Mutex::new(TraderState::new())),
-            news_articles: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -654,16 +683,6 @@ impl Engine {
             } else if sentiment < 0.3 {
                 ts.last_score *= 0.95;  // Lichte penalty voor negatief
             }
-        }
-    }
-
-    // NIEUW: add_news_article functie voor nieuws-integratie
-    fn add_news_article(&self, article: NewsArticle) {
-        let mut articles = self.news_articles.lock().unwrap();
-        articles.push(article);
-        // Keep only last 100 articles to prevent memory issues
-        if articles.len() > 100 {
-            articles.remove(0);
         }
     }
 
@@ -1628,6 +1647,8 @@ fn snapshot(&self) -> Vec<Row> {
                 whale_pred_label,
                 reliability_score,
                 reliability_label,
+                news_sentiment: v.news_sentiment,
+                last_update_ts: v.last_update_ts,
             });
         }
 
@@ -3184,18 +3205,18 @@ async function loadStars() {
 
 async function loadNews() {
   let includeStable = document.getElementById("news-stable-filter").checked;
-  fetch("/api/stats")
+  fetch("/api/news")
     .then(r => r.json())
     .then(data => {
       let tbody = document.querySelector("#news-table tbody");
       tbody.innerHTML = "";
       for (let r of data.filter(row => includeStable || !isStablecoin(row.pair))) {
-        let sentiment = r.news_sentiment || 0.5;
+        let sentiment = r.sentiment;
         let classSent = sentiment > 0.7 ? "pos" : (sentiment < 0.3 ? "neg" : "");
         tbody.innerHTML += `<tr>
           <td>${r.pair}</td>
           <td class="${classSent}">${sentiment.toFixed(2)}</td>
-          <td>${new Date(r.last_update_ts * 1000).toLocaleString()}</td>
+          <td>${new Date(r.last_update * 1000).toLocaleString()}</td>
           <td>N/A</td>
         </tr>`;
       }
@@ -3702,17 +3723,6 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
                             // Extract pair van title (bijv. "BTC" of "Bitcoin")
                             if let Some(pair) = extract_pair_from_title(&title) {
                                 engine.update_sentiment(&pair, sentiment);
-                                
-                                // Store the news article
-                                let article = NewsArticle {
-                                    title: title.clone(),
-                                    pair: pair.clone(),
-                                    sentiment,
-                                    timestamp: Utc::now().timestamp(),
-                                    source: "CoinDesk".to_string(),
-                                };
-                                engine.add_news_article(article);
-                                
                                 println!("[NEWS] {} sentiment {:.2} for {}", title, sentiment, pair);
                             }
                         }
@@ -3981,14 +3991,6 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             warp::reply::json(&news_data)
         });
 
-    // NIEUW: API voor nieuws artikelen
-    let api_news_articles = warp::path!("api" / "news_articles")
-        .and(engine_filter.clone())
-        .map(|engine: Engine| {
-            let articles = engine.news_articles.lock().unwrap();
-            warp::reply::json(&*articles)
-        });
-
     let index = warp::path::end().map(|| warp::reply::html(DASHBOARD_HTML));
 
     let routes = api_stats
@@ -4004,7 +4006,6 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
         .or(api_config_post)
         .or(api_config_reset)
         .or(api_news) // NIEUW: Toegevoegd aan routes
-        .or(api_news_articles) // NIEUW: Toegevoegd voor nieuws artikelen
         .or(index);
 
     let mut port: u16 = 8080;
