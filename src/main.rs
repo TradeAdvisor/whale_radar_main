@@ -67,7 +67,7 @@ lazy_static! {
 lazy_static! {
     static ref SENTIMENT_MAP: HashMap<String, Vec<String>> = {
         let json_str = include_str!("sentiment_words.json");
-        serde_json::from_str(json_str).expect("Failed to parse sentiment_words.json: ensure valid JSON format with string keys and array values")
+        serde_json::from_str(json_str).expect("Failed to parse sentiment_words.json: expected JSON object with string keys mapping to string arrays")
     };
 }
 
