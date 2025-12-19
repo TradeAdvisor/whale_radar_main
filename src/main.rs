@@ -575,6 +575,7 @@ struct BacktestResult {
 
 const MANUAL_TRADES_FILE: &str = "manual_trades.json";
 const MANUAL_EQUITY_FILE: &str = "manual_trades_equity.json";
+const MANUAL_BASE_NOTIONAL: f64 = 100.0; // Base notional for manual trades
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManualTrade {
@@ -619,7 +620,13 @@ impl ManualTraderState {
     async fn load() -> Self {
         match tokio::fs::read_to_string(MANUAL_TRADES_FILE).await {
             Ok(content) => {
-                serde_json::from_str(&content).unwrap_or_else(|_| Self::new())
+                match serde_json::from_str(&content) {
+                    Ok(state) => state,
+                    Err(e) => {
+                        eprintln!("[WARN] Failed to parse {}: {}. Starting fresh.", MANUAL_TRADES_FILE, e);
+                        Self::new()
+                    }
+                }
             }
             Err(_) => Self::new(),
         }
@@ -641,7 +648,7 @@ impl ManualTraderState {
         if self.trades.contains_key(pair) {
             return false; // Already have a position
         }
-        let notional = 100.0; // Base notional for manual trades
+        let notional = MANUAL_BASE_NOTIONAL;
         let size = notional / price;
         let sl = price * (1.0 - sl_pct / 100.0);
         let tp = price * (1.0 + tp_pct / 100.0);
@@ -2119,8 +2126,12 @@ fn snapshot(&self) -> Vec<Row> {
             (success, trader.clone())
         };
         if success {
-            let _ = state_clone.save().await;
-            let _ = state_clone.save_equity().await;
+            if let Err(e) = state_clone.save().await {
+                eprintln!("[ERROR] Failed to save manual trades: {}", e);
+            }
+            if let Err(e) = state_clone.save_equity().await {
+                eprintln!("[ERROR] Failed to save equity: {}", e);
+            }
         }
         success
     }
@@ -2136,15 +2147,20 @@ fn snapshot(&self) -> Vec<Row> {
             (success, trader.clone())
         };
         if success {
-            let _ = state_clone.save().await;
-            let _ = state_clone.save_equity().await;
+            if let Err(e) = state_clone.save().await {
+                eprintln!("[ERROR] Failed to save manual trades: {}", e);
+            }
+            if let Err(e) = state_clone.save_equity().await {
+                eprintln!("[ERROR] Failed to save equity: {}", e);
+            }
         }
         success
     }
 
     async fn load_manual_trader(&self) {
+        let loaded_state = ManualTraderState::load().await;
         let mut trader = self.manual_trader.lock().unwrap();
-        *trader = ManualTraderState::load().await;
+        *trader = loaded_state;
     }
 }
 
