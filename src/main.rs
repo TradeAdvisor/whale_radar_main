@@ -570,12 +570,14 @@ struct BacktestResult {
 }
 
 // ============================================================================
-// HOOFDSTUK 5 – VIRTUELE TRADER (PAPER TRADING)
+// HOOFDSTUK 5 – MANUAL TRADING MODULE
 // ============================================================================
 
+const MANUAL_TRADES_FILE: &str = "manual_trades.json";
+const MANUAL_EQUITY_FILE: &str = "manual_trades_equity.json";
 
-#[derive(Debug, Clone)]
-struct Position {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManualTrade {
     pair: String,
     entry_price: f64,
     size: f64,
@@ -596,57 +598,54 @@ struct TradeRecord {
     reason: String,
 }
 
-#[derive(Debug)]
-struct TraderState {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManualTraderState {
     initial_balance: f64,
     balance: f64,
-    base_notional: f64,
-    max_positions: usize,
-    positions: HashMap<String, Position>,
-    realized_pnl: f64,
-    trade_history: Vec<TradeRecord>,
+    trades: HashMap<String, ManualTrade>,
     equity_curve: Vec<(i64, f64)>,
 }
 
-impl TraderState {
+impl ManualTraderState {
     fn new() -> Self {
         Self {
             initial_balance: VIRTUAL_INITIAL_BALANCE,
             balance: VIRTUAL_INITIAL_BALANCE,
-            base_notional: VIRTUAL_BASE_NOTIONAL,
-            max_positions: VIRTUAL_MAX_POSITIONS,
-            positions: HashMap::new(),
-            realized_pnl: 0.0,
-            trade_history: Vec::new(),
+            trades: HashMap::new(),
             equity_curve: vec![(chrono::Utc::now().timestamp(), VIRTUAL_INITIAL_BALANCE)],
         }
     }
 
-    fn add_trade_record(&mut self, record: TradeRecord) {
-        self.trade_history.push(record);
-        if self.trade_history.len() > 1000 {
-            self.trade_history.remove(0);
-        }
-        let now = chrono::Utc::now().timestamp();
-        self.equity_curve.push((now, self.balance));
-        if self.equity_curve.len() > 365 {
-            self.equity_curve.remove(0);
+    async fn load() -> Self {
+        match tokio::fs::read_to_string(MANUAL_TRADES_FILE).await {
+            Ok(content) => {
+                serde_json::from_str(&content).unwrap_or_else(|_| Self::new())
+            }
+            Err(_) => Self::new(),
         }
     }
 
-    // NIEUW: Handmatige positie openen
-    fn manual_open_position(&mut self, pair: &str, price: f64, sl_pct: f64, tp_pct: f64) -> bool {
-        if self.positions.contains_key(pair) {
-            return false; // Al een positie
+    async fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::to_string_pretty(self)?;
+        tokio::fs::write(MANUAL_TRADES_FILE, json).await?;
+        Ok(())
+    }
+
+    async fn save_equity(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::to_string_pretty(&self.equity_curve)?;
+        tokio::fs::write(MANUAL_EQUITY_FILE, json).await?;
+        Ok(())
+    }
+
+    fn add_trade(&mut self, pair: &str, price: f64, sl_pct: f64, tp_pct: f64) -> bool {
+        if self.trades.contains_key(pair) {
+            return false; // Already have a position
         }
-        if self.positions.len() >= self.max_positions {
-            return false;
-        }
-        let notional = self.base_notional;
+        let notional = 100.0; // Base notional for manual trades
         let size = notional / price;
         let sl = price * (1.0 - sl_pct / 100.0);
         let tp = price * (1.0 + tp_pct / 100.0);
-        let pos = Position {
+        let trade = ManualTrade {
             pair: pair.to_string(),
             entry_price: price,
             size,
@@ -654,17 +653,36 @@ impl TraderState {
             stop_loss: sl,
             take_profit: tp,
         };
-        self.positions.insert(pair.to_string(), pos);
+        self.trades.insert(pair.to_string(), trade);
         println!(
-            "[MANUAL BUY] OPEN LONG {} at {:.5} size {:.5} SL={:.5} TP={:.5}",
+            "[MANUAL TRADE] OPEN {} at {:.5} size {:.5} SL={:.5} TP={:.5}",
             pair, price, size, sl, tp
         );
         true
     }
+
+    fn close_trade(&mut self, pair: &str, exit_price: f64) -> bool {
+        if let Some(trade) = self.trades.remove(pair) {
+            let pnl = (exit_price - trade.entry_price) * trade.size;
+            self.balance += pnl;
+            let now = chrono::Utc::now().timestamp();
+            self.equity_curve.push((now, self.balance));
+            if self.equity_curve.len() > 365 {
+                self.equity_curve.remove(0);
+            }
+            println!(
+                "[MANUAL TRADE] CLOSED {} at {:.5} PnL={:.2}",
+                pair, exit_price, pnl
+            );
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct PositionView {
+struct ManualTradeView {
     pair: String,
     entry_price: f64,
     size: f64,
@@ -677,21 +695,10 @@ struct PositionView {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct PositionsResponse {
+struct ManualTradesResponse {
     balance: f64,
-    realized_pnl: f64,
-    unrealized_pnl: f64,
-    positions: Vec<PositionView>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PaperPortfolioResponse {
-    balance: f64,
-    realized_pnl: f64,
-    unrealized_pnl: f64,
-    positions: usize,
-    total_trades: usize,
-    winrate: f64,
+    initial_balance: f64,
+    trades: Vec<ManualTradeView>,
 }
 
 // ============================================================================
@@ -709,7 +716,7 @@ trades: Arc<DashMap<String, TradeState>>,
     signalled_pairs: Arc<DashMap<String, bool>>,
     weights: Arc<Mutex<ScoreWeights>>,
 
-    trader: Arc<Mutex<TraderState>>, 
+    manual_trader: Arc<Mutex<ManualTraderState>>, 
     news_sentiment: Arc<DashMap<String, (f64, i64, String)>>,
 }
 
@@ -723,7 +730,7 @@ impl Engine {
             signals: Arc::new(Mutex::new(Vec::new())),
             signalled_pairs: Arc::new(DashMap::new()),
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
-            trader: Arc::new(Mutex::new(TraderState::new())),
+            manual_trader: Arc::new(Mutex::new(ManualTraderState::new())),
             news_sentiment: Arc::new(DashMap::new()),
         }
     }
@@ -734,7 +741,7 @@ impl Engine {
 
     fn push_signal(&self, ev: SignalEvent) {
         self.mark_signalled(&ev.pair);
-        self.maybe_open_position_from_signal(&ev);
+        // No automatic position opening for manual trading
         let mut buf = self.signals.lock().unwrap();
         buf.push(ev);
         if buf.len() > 400 {
@@ -1398,8 +1405,8 @@ impl Engine {
             };
             self.push_signal(ev);
         }
-            self.handle_price_for_trader(pair, price, ts_int);
-}
+        // No automatic SL/TP handling for manual trading
+    }
 
     // -------------------------------------------------------------------------
     // TICKER / ANOMALY HANDLER
@@ -1868,110 +1875,38 @@ fn snapshot(&self) -> Vec<Row> {
         out
     }
 
-    fn maybe_open_position_from_signal(&self, ev: &SignalEvent) {
-        if ev.direction != "BUY" {
-            return;
-        }
-        if ev.rating != "ALPHA BUY" && ev.rating != "STRONG BUY" {
-            return;
-        }
-        if ev.price <= 0.0 {
-            return;
-        }
-        let mut trader = self.trader.lock().unwrap();
-        if trader.positions.contains_key(&ev.pair) {
-            return;
-        }
-        if trader.positions.len() >= trader.max_positions {
-            return;
-        }
-        let notional = trader.base_notional;
-        let size = notional / ev.price;
-        let sl = ev.price * (1.0 - VIRTUAL_SL_PCT);
-        let tp = ev.price * (1.0 + VIRTUAL_TP_PCT);
-        let pos = Position {
-            pair: ev.pair.clone(),
-            entry_price: ev.price,
-            size,
-            open_ts: ev.ts,
-            stop_loss: sl,
-            take_profit: tp,
-        };
-        trader.positions.insert(ev.pair.clone(), pos);
-        println!(
-            "[TRADER] OPEN LONG {} at {:.5} size {:.5} SL={:.5} TP={:.5} (rating={})",
-            ev.pair, ev.price, size, sl, tp, ev.rating
-        );
-    }
-
-    fn handle_price_for_trader(&self, pair: &str, price: f64, _ts: i64) {
-        let mut trader = self.trader.lock().unwrap();
-        if let Some(pos) = trader.positions.get(pair).cloned() {
-            let hit_sl = price <= pos.stop_loss;
-            let hit_tp = price >= pos.take_profit;
-            if hit_sl || hit_tp {
-                let pnl = (price - pos.entry_price) * pos.size;
-                trader.balance += pnl;
-                trader.realized_pnl += pnl;
-                let record = TradeRecord {
-                    pair: pair.to_string(),
-                    entry_price: pos.entry_price,
-                    exit_price: price,
-                    size: pos.size,
-                    pnl,
-                    open_ts: pos.open_ts,
-                    close_ts: chrono::Utc::now().timestamp(),
-                    reason: if hit_tp { "TP" } else { "SL" }.to_string(),
-                };
-                trader.add_trade_record(record);
-                trader.positions.remove(pair);
-                println!(
-                    "[TRADER] CLOSE LONG {} at {:.5} (entry {:.5}, size {:.5}) PnL={:.4}{}",
-                    pair,
-                    price,
-                    pos.entry_price,
-                    pos.size,
-                    pnl,
-                    if hit_tp { " (TP)" } else { " (SL)" }
-                );
-            }
-        }
-    }
-
-    fn positions_snapshot(&self) -> PositionsResponse {
-        let trader = self.trader.lock().unwrap();
-        let mut unrealized = 0.0_f64;
+    // Manual trading methods - no automatic position opening
+    fn manual_trades_snapshot(&self) -> ManualTradesResponse {
+        let trader = self.manual_trader.lock().unwrap();
         let mut list = Vec::new();
-        for (pair, pos) in trader.positions.iter() {
+        for (pair, trade) in trader.trades.iter() {
             let current_price = self
                 .candles
                 .get(pair)
                 .and_then(|c| c.close)
-                .unwrap_or(pos.entry_price);
-            let pnl = (current_price - pos.entry_price) * pos.size;
-            let pnl_pct = if pos.entry_price > 0.0 {
-                (current_price - pos.entry_price) / pos.entry_price * 100.0
+                .unwrap_or(trade.entry_price);
+            let pnl = (current_price - trade.entry_price) * trade.size;
+            let pnl_pct = if trade.entry_price > 0.0 {
+                (current_price - trade.entry_price) / trade.entry_price * 100.0
             } else {
                 0.0
             };
-            unrealized += pnl;
-            list.push(PositionView {
+            list.push(ManualTradeView {
                 pair: pair.clone(),
-                entry_price: pos.entry_price,
-                size: pos.size,
-                open_ts: pos.open_ts,
-                stop_loss: pos.stop_loss,
-                take_profit: pos.take_profit,
+                entry_price: trade.entry_price,
+                size: trade.size,
+                open_ts: trade.open_ts,
+                stop_loss: trade.stop_loss,
+                take_profit: trade.take_profit,
                 current_price,
                 pnl_abs: pnl,
                 pnl_pct,
             });
         }
-        PositionsResponse {
-            balance: trader.balance + unrealized,
-            realized_pnl: trader.realized_pnl,
-            unrealized_pnl: unrealized,
-            positions: list,
+        ManualTradesResponse {
+            balance: trader.balance,
+            initial_balance: trader.initial_balance,
+            trades: list,
         }
     }
 
@@ -2173,13 +2108,43 @@ fn snapshot(&self) -> Vec<Row> {
     }
 
     // NIEUW: Handmatige buy
-    fn manual_buy(&self, pair: &str, sl_pct: f64, tp_pct: f64) -> bool {
+    async fn manual_add_trade(&self, pair: &str, sl_pct: f64, tp_pct: f64) -> bool {
         let current_price = self.candles.get(pair).and_then(|c| c.close).unwrap_or(0.0);
         if current_price <= 0.0 {
             return false;
         }
-        let mut trader = self.trader.lock().unwrap();
-        trader.manual_open_position(pair, current_price, sl_pct, tp_pct)
+        let (success, state_clone) = {
+            let mut trader = self.manual_trader.lock().unwrap();
+            let success = trader.add_trade(pair, current_price, sl_pct, tp_pct);
+            (success, trader.clone())
+        };
+        if success {
+            let _ = state_clone.save().await;
+            let _ = state_clone.save_equity().await;
+        }
+        success
+    }
+
+    async fn manual_close_trade(&self, pair: &str) -> bool {
+        let current_price = self.candles.get(pair).and_then(|c| c.close).unwrap_or(0.0);
+        if current_price <= 0.0 {
+            return false;
+        }
+        let (success, state_clone) = {
+            let mut trader = self.manual_trader.lock().unwrap();
+            let success = trader.close_trade(pair, current_price);
+            (success, trader.clone())
+        };
+        if success {
+            let _ = state_clone.save().await;
+            let _ = state_clone.save_equity().await;
+        }
+        success
+    }
+
+    async fn load_manual_trader(&self) {
+        let mut trader = self.manual_trader.lock().unwrap();
+        *trader = ManualTraderState::load().await;
     }
 }
 
@@ -2292,7 +2257,7 @@ tr:nth-child(even){ background:#252525; }
     <button class="tab-btn active" data-tab="markets">Markets</button>
     <button class="tab-btn" data-tab="signals">Signals</button>
     <button class="tab-btn" data-tab="top10">Top 10</button>
-    <button class="tab-btn" data-tab="paper_trading">Paper Trading</button>
+    <button class="tab-btn" data-tab="manual_trades">Manual Trades</button>
     <button class="tab-btn" data-tab="backtest">Backtest</button>
     <button class="tab-btn" data-tab="heatmap">Heatmap</button>
     <button class="tab-btn" data-tab="stars">Stars</button>
@@ -2400,51 +2365,58 @@ tr:nth-child(even){ background:#252525; }
     </table>
   </div>
 
-  <div id="view-paper_trading" style="display:none;">
-    <div style="margin-bottom:10px;">
-      <label for="paper-stable-filter">Include Stablecoins:</label>
-      <input type="checkbox" id="paper-stable-filter" checked />
+  <div id="view-manual_trades" style="display:none;">
+    <h2>Manual Trades</h2>
+    <div id="manual-summary" style="margin-bottom:15px; padding:10px; background:#222; border-radius:5px;">
+      <p><strong>Balance:</strong> <span id="manual-balance">€0.00</span></p>
+      <p><strong>Initial Balance:</strong> <span id="manual-initial">€0.00</span></p>
+      <p><strong>Total PnL:</strong> <span id="manual-pnl" class="pos">€0.00</span></p>
     </div>
-    <h2>Paper Trading Portfolio</h2>
-    <div id="portfolio-summary"></div>
-    <h3>Manual Buy</h3>
-    <div style="margin-bottom:10px;">
+    
+    <h3>Open a Trade</h3>
+    <div style="margin-bottom:20px; padding:10px; background:#1a1a1a; border-radius:5px;">
       <label>Pair:</label>
-      <select id="manual-pair">
+      <input type="text" id="manual-pair-search" placeholder="Search pair..." style="width:200px; margin-left:5px;" />
+      <select id="manual-pair" style="width:200px; margin-left:10px;">
         <!-- Vul dynamisch met pairs -->
       </select>
-      <label style="margin-left:10px;">SL %:</label>
+      <br/><br/>
+      <label style="margin-right:10px;">Stop Loss %:</label>
       <select id="manual-sl">
         <option value="0.5">0.5%</option>
         <option value="1">1%</option>
-        <option value="2">2%</option>
+        <option value="2" selected>2%</option>
         <option value="5">5%</option>
       </select>
-      <label style="margin-left:10px;">TP %:</label>
+      <label style="margin-left:20px; margin-right:10px;">Take Profit %:</label>
       <select id="manual-tp">
         <option value="1">1%</option>
         <option value="2">2%</option>
-        <option value="5">5%</option>
+        <option value="5" selected>5%</option>
         <option value="10">10%</option>
       </select>
-      <button id="manual-buy-btn">Buy</button>
+      <button id="manual-open-btn" style="margin-left:20px; padding:5px 15px;">Open Trade</button>
     </div>
-    <h3>Open Positions</h3>
-    <table id="open-positions">
+    
+    <h3>Active Trades</h3>
+    <table id="manual-trades-table">
       <thead>
-        <tr><th>Pair</th><th>Entry Price</th><th>Size</th><th>Current Price</th><th>PnL Abs</th><th>PnL %</th><th>Open TS</th></tr>
+        <tr>
+          <th>Pair</th>
+          <th>Entry Price</th>
+          <th>Size</th>
+          <th>Current Price</th>
+          <th>PnL Abs</th>
+          <th>PnL %</th>
+          <th>Open TS</th>
+          <th>Actions</th>
+        </tr>
       </thead>
       <tbody></tbody>
     </table>
+    
     <h3>Equity Curve</h3>
-    <canvas id="paper-equity" width="900" height="260" style="border:1px solid #333; background:#111;"></canvas>
-    <h3>Trade History</h3>
-    <table id="paper-history">
-      <thead>
-        <tr><th>Pair</th><th>Entry</th><th>Exit</th><th>Size</th><th>PnL</th><th>Reason</th><th>Duration (min)</th></tr>
-      </thead>
-      <tbody></tbody>
-    </table>
+    <canvas id="manual-equity" width="900" height="260" style="border:1px solid #333; background:#111;"></canvas>
   </div>
 
   <div id="view-backtest" style="display:none;">
@@ -2701,8 +2673,8 @@ function switchTab(tab) {
     tab === "signals" ? "block" : "none";
   document.getElementById("view-top10").style.display =
     tab === "top10" ? "block" : "none";
-  document.getElementById("view-paper_trading").style.display =
-    tab === "paper_trading" ? "block" : "none";
+  document.getElementById("view-manual_trades").style.display =
+    tab === "manual_trades" ? "block" : "none";
   document.getElementById("view-backtest").style.display =
     tab === "backtest" ? "block" : "none";
   document.getElementById("view-heatmap").style.display =
@@ -2720,8 +2692,8 @@ function switchTab(tab) {
     loadHeatmap();
   } else if (tab === "backtest") {
     loadBacktest();
-  } else if (tab === "paper_trading") {
-    loadPaperTrading();
+  } else if (tab === "manual_trades") {
+    loadManualTrades();
   } else if (tab === "stars") {
     loadStars();
   } else if (tab === "news") {
@@ -2950,20 +2922,18 @@ async function loadTop10() {
   applyDirFilter('top10-down', 'top10-dir-filter');
 }
 
-async function loadPaperTrading() {
-  let includeStable = document.getElementById("paper-stable-filter").checked;
-  // Portfolio overzicht
-  let portfolio = await fetch("/api/paper_portfolio").then(r => r.json());
-  document.getElementById("portfolio-summary").innerHTML = `
-    <p>Balance: €${portfolio.balance.toFixed(2)}</p>
-    <p>Realized PnL: €${portfolio.realized_pnl.toFixed(2)}</p>
-    <p>Unrealized PnL: €${portfolio.unrealized_pnl.toFixed(2)}</p>
-    <p>Positions: ${portfolio.positions}</p>
-    <p>Total Trades: ${portfolio.total_trades}</p>
-    <p>Winrate: ${portfolio.winrate.toFixed(1)}%</p>
-  `;
+async function loadManualTrades() {
+  // Get manual trades data
+  let tradesData = await fetch("/api/manual_trades").then(r => r.json());
+  
+  // Update summary
+  let totalPnl = tradesData.balance - tradesData.initial_balance;
+  document.getElementById("manual-balance").textContent = `€${tradesData.balance.toFixed(2)}`;
+  document.getElementById("manual-initial").textContent = `€${tradesData.initial_balance.toFixed(2)}`;
+  document.getElementById("manual-pnl").textContent = `€${totalPnl.toFixed(2)}`;
+  document.getElementById("manual-pnl").className = totalPnl > 0 ? 'pos' : (totalPnl < 0 ? 'neg' : '');
 
-  // Vul pair dropdown
+  // Populate pair dropdown with search functionality
   let pairs = await fetch("/api/stats").then(r => r.json()).then(d => d.map(r => r.pair));
   let select = document.getElementById("manual-pair");
   select.innerHTML = "";
@@ -2973,75 +2943,100 @@ async function loadPaperTrading() {
     opt.text = p;
     select.appendChild(opt);
   });
+  
+  // Add search filter for pairs
+  let searchInput = document.getElementById("manual-pair-search");
+  searchInput.addEventListener("input", () => {
+    let query = searchInput.value.toLowerCase();
+    select.innerHTML = "";
+    pairs.filter(p => p.toLowerCase().includes(query)).forEach(p => {
+      let opt = document.createElement("option");
+      opt.value = p;
+      opt.text = p;
+      select.appendChild(opt);
+    });
+  });
 
-  // Open posities
-  let positions = await fetch("/api/positions").then(r => r.json());
-  let tbody = document.querySelector("#open-positions tbody");
+  // Display active trades
+  let tbody = document.querySelector("#manual-trades-table tbody");
   tbody.innerHTML = "";
-  positions.forEach(pos => {
+  tradesData.trades.forEach(trade => {
     tbody.innerHTML += `
       <tr>
-        <td>${pos.pair}</td>
-        <td>${pos.entry_price.toFixed(4)}</td>
-        <td>${pos.size.toFixed(4)}</td>
-        <td>${pos.current_price.toFixed(4)}</td>
-        <td class="${pos.pnl_abs > 0 ? 'pos' : 'neg'}">€${pos.pnl_abs.toFixed(2)}</td>
-        <td class="${pos.pnl_pct > 0 ? 'pos' : 'neg'}">${pos.pnl_pct.toFixed(2)}%</td>
-        <td>${new Date(pos.open_ts * 1000).toLocaleString()}</td>
+        <td>${trade.pair}</td>
+        <td>${trade.entry_price.toFixed(5)}</td>
+        <td>${trade.size.toFixed(5)}</td>
+        <td>${trade.current_price.toFixed(5)}</td>
+        <td class="${trade.pnl_abs > 0 ? 'pos' : 'neg'}">€${trade.pnl_abs.toFixed(2)}</td>
+        <td class="${trade.pnl_pct > 0 ? 'pos' : 'neg'}">${trade.pnl_pct.toFixed(2)}%</td>
+        <td>${new Date(trade.open_ts * 1000).toLocaleString()}</td>
+        <td><button onclick="closeManualTrade('${trade.pair}')" style="padding:3px 8px;">Close</button></td>
       </tr>
     `;
   });
 
-  // Trade history tabel (bestaande)
-  let history = await fetch("/api/paper_history").then(r => r.json());
-  let histTbody = document.querySelector("#paper-history tbody");
-  histTbody.innerHTML = "";
-  history.filter(trade => includeStable || !isStablecoin(trade.pair)).forEach(trade => {
-    let duration = Math.round((trade.close_ts - trade.open_ts) / 60);
-    histTbody.innerHTML += `<tr>
-      <td>${trade.pair}</td>
-      <td>${trade.entry_price.toFixed(4)}</td>
-      <td>${trade.exit_price.toFixed(4)}</td>
-      <td>${trade.size.toFixed(4)}</td>
-      <td class="${trade.pnl > 0 ? 'pos' : 'neg'}">€${trade.pnl.toFixed(2)}</td>
-      <td>${trade.reason}</td>
-      <td>${duration}</td>
-    </tr>`;
-  });
-
-  // Equity curve (bestaande)
-  let equity = await fetch("/api/paper_equity").then(r => r.json());
-  drawPaperEquity(equity);
+  // Draw equity curve
+  let equity = await fetch("/api/manual_equity").then(r => r.json());
+  drawManualEquity(equity);
 }
 
-// Event listener voor Buy knop
-document.getElementById("manual-buy-btn").addEventListener("click", async () => {
-  let pair = document.getElementById("manual-pair").value;
-  let sl_pct = parseFloat(document.getElementById("manual-sl").value);
-  let tp_pct = parseFloat(document.getElementById("manual-tp").value);
-  let res = await fetch("/api/manual_buy", {
-    method: "POST",
+// Event listener for Open Trade button
+window.addEventListener("load", () => {
+  document.getElementById("manual-open-btn").addEventListener("click", async () => {
+    let pair = document.getElementById("manual-pair").value;
+    let sl_pct = parseFloat(document.getElementById("manual-sl").value);
+    let tp_pct = parseFloat(document.getElementById("manual-tp").value);
+    
+    if (!pair) {
+      alert("Please select a pair!");
+      return;
+    }
+    
+    let res = await fetch("/api/manual_trade", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({pair, sl_pct, tp_pct})
+    });
+    let result = await res.json();
+    if (result.success) {
+      alert(`Trade opened for ${pair}!`);
+      loadManualTrades();
+    } else {
+      alert(`Failed to open trade for ${pair}. Trade may already exist or price not available.`);
+    }
+  });
+});
+
+async function closeManualTrade(pair) {
+  if (!confirm(`Close trade for ${pair}?`)) {
+    return;
+  }
+  
+  let res = await fetch("/api/manual_trade", {
+    method: "DELETE",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({pair, sl_pct, tp_pct})
+    body: JSON.stringify({pair})
   });
   let result = await res.json();
   if (result.success) {
-    alert("Manual buy successful!");
-    loadPaperTrading(); // Herlaad
+    alert(`Trade closed for ${pair}!`);
+    loadManualTrades();
   } else {
-    alert("Manual buy failed!");
+    alert(`Failed to close trade for ${pair}.`);
   }
-});
+}
 
-function drawPaperEquity(equity) {
-  let canvas = document.getElementById("paper-equity");
+function drawManualEquity(equity) {
+  let canvas = document.getElementById("manual-equity");
+  if (!canvas) return;
   let ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  // Eenvoudige lijn (zoals backtest)
+  
   if (equity.length < 2) return;
   let minY = Math.min(...equity.map(p => p[1]));
   let maxY = Math.max(...equity.map(p => p[1]));
   if (minY === maxY) minY -= 100;
+  
   let padding = 20;
   let w = canvas.width - padding * 2;
   let h = canvas.height - padding * 2;
@@ -3534,8 +3529,8 @@ function tick() {
     loadSignals();
   } else if (activeTab === "top10") {
     loadTop10();
-  } else if (activeTab === "paper_trading") {
-    loadPaperTrading();
+  } else if (activeTab === "manual_trades") {
+    loadManualTrades();
   } else if (activeTab === "backtest") {
     loadBacktest();
   } else if (activeTab === "news") {
@@ -4080,41 +4075,16 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
         .and(engine_filter.clone())
         .map(|engine: Engine| warp::reply::json(&engine.backtest_snapshot()));
 
-    let api_paper_portfolio = warp::path!("api" / "paper_portfolio")
+    let api_manual_trades = warp::path!("api" / "manual_trades")
         .and(engine_filter.clone())
-        .map(|engine: Engine| {
-            let trader = engine.trader.lock().unwrap();
-            warp::reply::json(&PaperPortfolioResponse {
-                balance: trader.balance,
-                realized_pnl: trader.realized_pnl,
-                unrealized_pnl: trader.balance - trader.initial_balance - trader.realized_pnl,
-                positions: trader.positions.len(),
-                total_trades: trader.trade_history.len(),
-                winrate: if trader.trade_history.is_empty() {
-                    0.0
-                } else {
-                    trader.trade_history.iter().filter(|t| t.pnl > 0.0).count() as f64 / trader.trade_history.len() as f64 * 100.0
-                },
-            })
-        });
+        .map(|engine: Engine| warp::reply::json(&engine.manual_trades_snapshot()));
 
-    let api_paper_history = warp::path!("api" / "paper_history")
+    let api_manual_equity = warp::path!("api" / "manual_equity")
         .and(engine_filter.clone())
         .map(|engine: Engine| {
-            let trader = engine.trader.lock().unwrap();
-            warp::reply::json(&trader.trade_history)
-        });
-
-    let api_paper_equity = warp::path!("api" / "paper_equity")
-        .and(engine_filter.clone())
-        .map(|engine: Engine| {
-            let trader = engine.trader.lock().unwrap();
+            let trader = engine.manual_trader.lock().unwrap();
             warp::reply::json(&trader.equity_curve)
         });
-
-    let api_positions = warp::path!("api" / "positions")
-        .and(engine_filter.clone())
-        .map(|engine: Engine| warp::reply::json(&engine.positions_snapshot()));
 
     let api_config_get = warp::path!("api" / "config")
         .and(config_filter.clone())
@@ -4162,15 +4132,26 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             warp::reply::json(&news_data)
         });
 
-    let api_manual_buy = warp::path!("api" / "manual_buy")
+    let api_manual_trade_post = warp::path!("api" / "manual_trade")
+        .and(warp::post())
         .and(warp::body::json())
         .and(engine_filter.clone())
-        .map(|body: serde_json::Value, engine: Engine| {
+        .and_then(|body: serde_json::Value, engine: Engine| async move {
             let pair = body["pair"].as_str().unwrap_or("");
-            let sl_pct = body["sl_pct"].as_f64().unwrap_or(0.0);
-            let tp_pct = body["tp_pct"].as_f64().unwrap_or(0.0);
-            let success = engine.manual_buy(pair, sl_pct, tp_pct);
-            warp::reply::json(&serde_json::json!({"success": success}))
+            let sl_pct = body["sl_pct"].as_f64().unwrap_or(2.0);
+            let tp_pct = body["tp_pct"].as_f64().unwrap_or(5.0);
+            let success = engine.manual_add_trade(pair, sl_pct, tp_pct).await;
+            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"success": success})))
+        });
+
+    let api_manual_trade_delete = warp::path!("api" / "manual_trade")
+        .and(warp::delete())
+        .and(warp::body::json())
+        .and(engine_filter.clone())
+        .and_then(|body: serde_json::Value, engine: Engine| async move {
+            let pair = body["pair"].as_str().unwrap_or("");
+            let success = engine.manual_close_trade(pair).await;
+            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"success": success})))
         });
 
     let index = warp::path::end().map(|| warp::reply::html(DASHBOARD_HTML));
@@ -4180,15 +4161,14 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
         .or(api_top10)
         .or(api_heatmap)
         .or(api_backtest)
-        .or(api_paper_portfolio)
-        .or(api_paper_history)
-        .or(api_paper_equity)
-        .or(api_positions)
+        .or(api_manual_trades)
+        .or(api_manual_equity)
+        .or(api_manual_trade_post)
+        .or(api_manual_trade_delete)
         .or(api_config_get)
         .or(api_config_post)
         .or(api_config_reset)
         .or(api_news)
-        .or(api_manual_buy)
         .or(index);
 
     let mut port: u16 = 8080;
@@ -4271,6 +4251,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Arc::new(Mutex::new(load_config().await));
     let engine = Engine::new();
+    
+    // Load manual trader state from JSON
+    engine.load_manual_trader().await;
+    println!("Loaded manual trader state");
+    
     let engine_for_ws = engine.clone();
 
     // Clone chunks for orderbook workers
