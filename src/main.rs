@@ -65,9 +65,59 @@ lazy_static! {
 }
 
 lazy_static! {
-    static ref SENTIMENT_MAP: HashMap<String, Vec<String>> = {
-        let json_str = include_str!("sentiment_words.json");
-        serde_json::from_str(json_str).expect("Failed to parse sentiment_words.json")
+    static ref SENTIMENT_MAP: HashMap<String, Vec<(String, i32)>> = {
+        match std::fs::read_to_string("sentiment_words.json") {
+            Ok(content) => {
+                match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(data) => {
+                        let mut map = HashMap::new();
+                        // Parse positive words
+                        if let Some(pos_arr) = data["positive"].as_array() {
+                            let pos_vec: Vec<(String, i32)> = pos_arr.iter().filter_map(|item| {
+                                if let Some(arr) = item.as_array() {
+                                    if arr.len() == 2 {
+                                        let word = arr[0].as_str()?.to_string();
+                                        let weight = arr[1].as_i64()? as i32;
+                                        Some((word, weight))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            }).collect();
+                            map.insert("positive".to_string(), pos_vec);
+                        }
+                        // Parse negative words
+                        if let Some(neg_arr) = data["negative"].as_array() {
+                            let neg_vec: Vec<(String, i32)> = neg_arr.iter().filter_map(|item| {
+                                if let Some(arr) = item.as_array() {
+                                    if arr.len() == 2 {
+                                        let word = arr[0].as_str()?.to_string();
+                                        let weight = arr[1].as_i64()? as i32;
+                                        Some((word, weight))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            }).collect();
+                            map.insert("negative".to_string(), neg_vec);
+                        }
+                        map
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to parse sentiment_words.json: {}", e);
+                        HashMap::new()
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!("Kon sentiment_words.json niet laden, gebruik lege lijsten");
+                HashMap::new()
+            }
+        }
     };
 }
 
@@ -582,6 +632,34 @@ impl TraderState {
         if self.equity_curve.len() > 365 {
             self.equity_curve.remove(0);
         }
+    }
+
+    // NIEUW: Handmatige positie openen
+    fn manual_open_position(&mut self, pair: &str, price: f64, sl_pct: f64, tp_pct: f64) -> bool {
+        if self.positions.contains_key(pair) {
+            return false; // Al een positie
+        }
+        if self.positions.len() >= self.max_positions {
+            return false;
+        }
+        let notional = self.base_notional;
+        let size = notional / price;
+        let sl = price * (1.0 - sl_pct / 100.0);
+        let tp = price * (1.0 + tp_pct / 100.0);
+        let pos = Position {
+            pair: pair.to_string(),
+            entry_price: price,
+            size,
+            open_ts: chrono::Utc::now().timestamp(),
+            stop_loss: sl,
+            take_profit: tp,
+        };
+        self.positions.insert(pair.to_string(), pos);
+        println!(
+            "[MANUAL BUY] OPEN LONG {} at {:.5} size {:.5} SL={:.5} TP={:.5}",
+            pair, price, size, sl, tp
+        );
+        true
     }
 }
 
@@ -2093,6 +2171,16 @@ fn snapshot(&self) -> Vec<Row> {
             fallers,
         }
     }
+
+    // NIEUW: Handmatige buy
+    fn manual_buy(&self, pair: &str, sl_pct: f64, tp_pct: f64) -> bool {
+        let current_price = self.candles.get(pair).and_then(|c| c.close).unwrap_or(0.0);
+        if current_price <= 0.0 {
+            return false;
+        }
+        let mut trader = self.trader.lock().unwrap();
+        trader.manual_open_position(pair, current_price, sl_pct, tp_pct)
+    }
 }
 
 // ============================================================================
@@ -2319,6 +2407,35 @@ tr:nth-child(even){ background:#252525; }
     </div>
     <h2>Paper Trading Portfolio</h2>
     <div id="portfolio-summary"></div>
+    <h3>Manual Buy</h3>
+    <div style="margin-bottom:10px;">
+      <label>Pair:</label>
+      <select id="manual-pair">
+        <!-- Vul dynamisch met pairs -->
+      </select>
+      <label style="margin-left:10px;">SL %:</label>
+      <select id="manual-sl">
+        <option value="0.5">0.5%</option>
+        <option value="1">1%</option>
+        <option value="2">2%</option>
+        <option value="5">5%</option>
+      </select>
+      <label style="margin-left:10px;">TP %:</label>
+      <select id="manual-tp">
+        <option value="1">1%</option>
+        <option value="2">2%</option>
+        <option value="5">5%</option>
+        <option value="10">10%</option>
+      </select>
+      <button id="manual-buy-btn">Buy</button>
+    </div>
+    <h3>Open Positions</h3>
+    <table id="open-positions">
+      <thead>
+        <tr><th>Pair</th><th>Entry Price</th><th>Size</th><th>Current Price</th><th>PnL Abs</th><th>PnL %</th><th>Open TS</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
     <h3>Equity Curve</h3>
     <canvas id="paper-equity" width="900" height="260" style="border:1px solid #333; background:#111;"></canvas>
     <h3>Trade History</h3>
@@ -2846,13 +2963,42 @@ async function loadPaperTrading() {
     <p>Winrate: ${portfolio.winrate.toFixed(1)}%</p>
   `;
 
-  // Trade history tabel
-  let history = await fetch("/api/paper_history").then(r => r.json());
-  let tbody = document.querySelector("#paper-history tbody");
+  // Vul pair dropdown
+  let pairs = await fetch("/api/stats").then(r => r.json()).then(d => d.map(r => r.pair));
+  let select = document.getElementById("manual-pair");
+  select.innerHTML = "";
+  pairs.forEach(p => {
+    let opt = document.createElement("option");
+    opt.value = p;
+    opt.text = p;
+    select.appendChild(opt);
+  });
+
+  // Open posities
+  let positions = await fetch("/api/positions").then(r => r.json());
+  let tbody = document.querySelector("#open-positions tbody");
   tbody.innerHTML = "";
+  positions.forEach(pos => {
+    tbody.innerHTML += `
+      <tr>
+        <td>${pos.pair}</td>
+        <td>${pos.entry_price.toFixed(4)}</td>
+        <td>${pos.size.toFixed(4)}</td>
+        <td>${pos.current_price.toFixed(4)}</td>
+        <td class="${pos.pnl_abs > 0 ? 'pos' : 'neg'}">€${pos.pnl_abs.toFixed(2)}</td>
+        <td class="${pos.pnl_pct > 0 ? 'pos' : 'neg'}">${pos.pnl_pct.toFixed(2)}%</td>
+        <td>${new Date(pos.open_ts * 1000).toLocaleString()}</td>
+      </tr>
+    `;
+  });
+
+  // Trade history tabel (bestaande)
+  let history = await fetch("/api/paper_history").then(r => r.json());
+  let histTbody = document.querySelector("#paper-history tbody");
+  histTbody.innerHTML = "";
   history.filter(trade => includeStable || !isStablecoin(trade.pair)).forEach(trade => {
     let duration = Math.round((trade.close_ts - trade.open_ts) / 60);
-    tbody.innerHTML += `<tr>
+    histTbody.innerHTML += `<tr>
       <td>${trade.pair}</td>
       <td>${trade.entry_price.toFixed(4)}</td>
       <td>${trade.exit_price.toFixed(4)}</td>
@@ -2863,10 +3009,29 @@ async function loadPaperTrading() {
     </tr>`;
   });
 
-  // Equity curve grafiek
+  // Equity curve (bestaande)
   let equity = await fetch("/api/paper_equity").then(r => r.json());
   drawPaperEquity(equity);
 }
+
+// Event listener voor Buy knop
+document.getElementById("manual-buy-btn").addEventListener("click", async () => {
+  let pair = document.getElementById("manual-pair").value;
+  let sl_pct = parseFloat(document.getElementById("manual-sl").value);
+  let tp_pct = parseFloat(document.getElementById("manual-tp").value);
+  let res = await fetch("/api/manual_buy", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({pair, sl_pct, tp_pct})
+  });
+  let result = await res.json();
+  if (result.success) {
+    alert("Manual buy successful!");
+    loadPaperTrading(); // Herlaad
+  } else {
+    alert("Manual buy failed!");
+  }
+});
 
 function drawPaperEquity(equity) {
   let canvas = document.getElementById("paper-equity");
@@ -3714,13 +3879,18 @@ async fn run_news_scanner(engine: Engine) -> Result<(), Box<dyn std::error::Erro
                             let negative_words = SENTIMENT_MAP.get("negative").cloned().unwrap_or_default();
 
                             let title_lower = title.to_lowercase();
-                            let pos_count: usize = positive_words.iter().map(|w| title_lower.matches(w).count()).sum();
-                            let neg_count: usize = negative_words.iter().map(|w| title_lower.matches(w).count()).sum();
-
-                            let sentiment = if pos_count + neg_count > 0 {
-                                (pos_count as f64) / ((pos_count + neg_count) as f64)
+                            let mut pos_score = 0.0;
+                            let mut neg_score = 0.0;
+                            for (word, weight) in &positive_words {
+                                pos_score += title_lower.matches(word).count() as f64 * *weight as f64;
+                            }
+                            for (word, weight) in &negative_words {
+                                neg_score += title_lower.matches(word).count() as f64 * *weight as f64;
+                            }
+                            let sentiment = if pos_score + neg_score > 0.0 {
+                                pos_score / (pos_score + neg_score)
                             } else {
-                                0.5 // Neutraal
+                                0.5
                             };
 
                             // Extract pair van title (bijv. "BTC" of "Bitcoin")
@@ -3992,6 +4162,17 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             warp::reply::json(&news_data)
         });
 
+    let api_manual_buy = warp::path!("api" / "manual_buy")
+        .and(warp::body::json())
+        .and(engine_filter.clone())
+        .map(|body: serde_json::Value, engine: Engine| {
+            let pair = body["pair"].as_str().unwrap_or("");
+            let sl_pct = body["sl_pct"].as_f64().unwrap_or(0.0);
+            let tp_pct = body["tp_pct"].as_f64().unwrap_or(0.0);
+            let success = engine.manual_buy(pair, sl_pct, tp_pct);
+            warp::reply::json(&serde_json::json!({"success": success}))
+        });
+
     let index = warp::path::end().map(|| warp::reply::html(DASHBOARD_HTML));
 
     let routes = api_stats
@@ -4006,7 +4187,8 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
         .or(api_config_get)
         .or(api_config_post)
         .or(api_config_reset)
-        .or(api_news) // NIEUW: Toegevoegd aan routes
+        .or(api_news)
+        .or(api_manual_buy)
         .or(index);
 
     let mut port: u16 = 8080;
@@ -4103,6 +4285,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("WS worker {} terminated with error: {:?}", i, err);
             }
         });
+        // Vertraging tussen workers om rate limiting te voorkomen
+        sleep(Duration::from_millis(500)).await;
     }
 
     // Spawn orderbook WebSocket workers
@@ -4115,6 +4299,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("OB worker {} terminated with error: {:?}", i, err);
             }
         });
+        // Vertraging tussen workers
+        sleep(Duration::from_millis(500)).await;
     }
 
     let engine_http = engine.clone();
