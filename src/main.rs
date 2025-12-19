@@ -2961,8 +2961,9 @@ async function loadManualTrades() {
       searchInput.addEventListener("input", () => {
         filterManualTradePairs();
       });
-      manualTradeSearchInitialized = true;
     }
+    // Set flag to true regardless to avoid repeated DOM queries
+    manualTradeSearchInitialized = true;
   }
   
   // Apply current filter to update dropdown
