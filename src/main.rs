@@ -2640,6 +2640,8 @@ let activeTab = "markets";
 
 let heatmapPoints = [];
 let heatTooltip = null;
+let manualTradePairs = [];
+let manualTradeSearchInitialized = false;
 
 const stablecoins = ["USDT", "USDC", "TUSD", "BUSD", "DAI", "UST", "FRAX", "LUSD"];
 
@@ -2949,29 +2951,23 @@ async function loadManualTrades() {
   document.getElementById("manual-pnl").textContent = `€${totalPnl.toFixed(2)}`;
   document.getElementById("manual-pnl").className = totalPnl > 0 ? 'pos' : (totalPnl < 0 ? 'neg' : '');
 
-  // Populate pair dropdown with search functionality
-  let pairs = await fetch("/api/stats").then(r => r.json()).then(d => d.map(r => r.pair));
-  let select = document.getElementById("manual-pair");
-  select.innerHTML = "";
-  pairs.forEach(p => {
-    let opt = document.createElement("option");
-    opt.value = p;
-    opt.text = p;
-    select.appendChild(opt);
-  });
+  // Update global pairs list
+  manualTradePairs = await fetch("/api/stats").then(r => r.json()).then(d => d.map(r => r.pair));
   
-  // Add search filter for pairs
-  let searchInput = document.getElementById("manual-pair-search");
-  searchInput.addEventListener("input", () => {
-    let query = searchInput.value.toLowerCase();
-    select.innerHTML = "";
-    pairs.filter(p => p.toLowerCase().includes(query)).forEach(p => {
-      let opt = document.createElement("option");
-      opt.value = p;
-      opt.text = p;
-      select.appendChild(opt);
-    });
-  });
+  // Initialize search filter once
+  if (!manualTradeSearchInitialized) {
+    let searchInput = document.getElementById("manual-pair-search");
+    if (searchInput) {
+      searchInput.addEventListener("input", () => {
+        filterManualTradePairs();
+      });
+    }
+    // Set flag to true regardless to avoid repeated DOM queries
+    manualTradeSearchInitialized = true;
+  }
+  
+  // Apply current filter to update dropdown
+  filterManualTradePairs();
 
   // Display active trades
   let tbody = document.querySelector("#manual-trades-table tbody");
@@ -2994,6 +2990,24 @@ async function loadManualTrades() {
   // Draw equity curve
   let equity = await fetch("/api/manual_equity").then(r => r.json());
   drawManualEquity(equity);
+}
+
+function filterManualTradePairs() {
+  let searchInput = document.getElementById("manual-pair-search");
+  let select = document.getElementById("manual-pair");
+  
+  if (!searchInput || !select) return;
+  
+  let query = searchInput.value.toLowerCase();
+  let filtered = manualTradePairs.filter(p => p.toLowerCase().includes(query));
+  
+  select.innerHTML = "";
+  filtered.forEach(p => {
+    let opt = document.createElement("option");
+    opt.value = p;
+    opt.text = p;
+    select.appendChild(opt);
+  });
 }
 
 // Event listener for Open Trade button
