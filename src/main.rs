@@ -2964,13 +2964,20 @@ async function loadManualTrades() {
   let searchInput = document.getElementById("manual-pair-search");
   searchInput.addEventListener("input", () => {
     let query = searchInput.value.toLowerCase();
+    // Preserve the currently selected value
+    let currentSelection = select.value;
     select.innerHTML = "";
-    pairs.filter(p => p.toLowerCase().includes(query)).forEach(p => {
+    let filteredPairs = pairs.filter(p => p.toLowerCase().includes(query));
+    filteredPairs.forEach(p => {
       let opt = document.createElement("option");
       opt.value = p;
       opt.text = p;
       select.appendChild(opt);
     });
+    // Restore selection if it still exists in filtered list
+    if (currentSelection && filteredPairs.includes(currentSelection)) {
+      select.value = currentSelection;
+    }
   });
 
   // Display active trades
