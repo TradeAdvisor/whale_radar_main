@@ -2964,6 +2964,7 @@ async function loadManualTrades() {
   let searchInput = document.getElementById("manual-pair-search");
   searchInput.addEventListener("input", () => {
     let query = searchInput.value.toLowerCase();
+    let currentValue = select.value; // Preserve the selected value
     select.innerHTML = "";
     pairs.filter(p => p.toLowerCase().includes(query)).forEach(p => {
       let opt = document.createElement("option");
@@ -2971,6 +2972,10 @@ async function loadManualTrades() {
       opt.text = p;
       select.appendChild(opt);
     });
+    // Restore the selected value if it's still in the filtered list
+    if (currentValue && Array.from(select.options).some(opt => opt.value === currentValue)) {
+      select.value = currentValue;
+    }
   });
 
   // Display active trades
