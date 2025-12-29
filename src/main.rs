@@ -49,8 +49,22 @@ use warp::Filter;
 
 lazy_static! {
     static ref KEYWORD_MAP: HashMap<String, String> = {
-        let json_str = include_str!("pair_keywords.json");
-        serde_json::from_str(json_str).expect("Failed to parse pair_keywords.json: ensure valid JSON format with string key-value pairs")
+        let mut map = HashMap::new();
+        map.insert("bitcoin".to_string(), "BTC/EUR".to_string());
+        map.insert("btc".to_string(), "BTC/EUR".to_string());
+        map.insert("ethereum".to_string(), "ETH/EUR".to_string());
+        map.insert("eth".to_string(), "ETH/EUR".to_string());
+        map.insert("xrp".to_string(), "XRP/EUR".to_string());
+        map.insert("ripple".to_string(), "XRP/EUR".to_string());
+        map.insert("doge".to_string(), "DOGE/EUR".to_string());
+        map.insert("dogecoin".to_string(), "DOGE/EUR".to_string());
+        map.insert("litecoin".to_string(), "LTC/EUR".to_string());
+        map.insert("ltc".to_string(), "LTC/EUR".to_string());
+        map.insert("cardano".to_string(), "ADA/EUR".to_string());
+        map.insert("ada".to_string(), "ADA/EUR".to_string());
+        map.insert("solana".to_string(), "SOL/EUR".to_string());
+        map.insert("sol".to_string(), "SOL/EUR".to_string());
+        map
     };
     
     // Pre-sorted keywords by length (descending) for efficient matching
@@ -66,58 +80,38 @@ lazy_static! {
 
 lazy_static! {
     static ref SENTIMENT_MAP: HashMap<String, Vec<(String, i32)>> = {
-        match std::fs::read_to_string("sentiment_words.json") {
-            Ok(content) => {
-                match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(data) => {
-                        let mut map = HashMap::new();
-                        // Parse positive words
-                        if let Some(pos_arr) = data["positive"].as_array() {
-                            let pos_vec: Vec<(String, i32)> = pos_arr.iter().filter_map(|item| {
-                                if let Some(arr) = item.as_array() {
-                                    if arr.len() == 2 {
-                                        let word = arr[0].as_str()?.to_string();
-                                        let weight = arr[1].as_i64()? as i32;
-                                        Some((word, weight))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            }).collect();
-                            map.insert("positive".to_string(), pos_vec);
-                        }
-                        // Parse negative words
-                        if let Some(neg_arr) = data["negative"].as_array() {
-                            let neg_vec: Vec<(String, i32)> = neg_arr.iter().filter_map(|item| {
-                                if let Some(arr) = item.as_array() {
-                                    if arr.len() == 2 {
-                                        let word = arr[0].as_str()?.to_string();
-                                        let weight = arr[1].as_i64()? as i32;
-                                        Some((word, weight))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            }).collect();
-                            map.insert("negative".to_string(), neg_vec);
-                        }
-                        map
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to parse sentiment_words.json: {}", e);
-                        HashMap::new()
-                    }
-                }
-            }
-            Err(_) => {
-                eprintln!("Kon sentiment_words.json niet laden, gebruik lege lijsten");
-                HashMap::new()
-            }
-        }
+        let mut map = HashMap::new();
+        // Hardcoded positive words
+        let positive = vec![
+            ("bull".to_string(), 2),
+            ("rally".to_string(), 2),
+            ("surge".to_string(), 3),
+            ("pump".to_string(), 3),
+            ("rise".to_string(), 1),
+            ("green".to_string(), 1),
+            ("up".to_string(), 1),
+            ("buy".to_string(), 2),
+            ("gain".to_string(), 1),
+            ("boom".to_string(), 3),
+            ("soar".to_string(), 2),
+        ];
+        // Hardcoded negative words
+        let negative = vec![
+            ("bear".to_string(), 2),
+            ("crash".to_string(), 3),
+            ("dump".to_string(), 3),
+            ("fall".to_string(), 1),
+            ("red".to_string(), 1),
+            ("down".to_string(), 1),
+            ("sell".to_string(), 2),
+            ("drop".to_string(), 1),
+            ("decline".to_string(), 1),
+            ("plunge".to_string(), 3),
+            ("slump".to_string(), 2),
+        ];
+        map.insert("positive".to_string(), positive);
+        map.insert("negative".to_string(), negative);
+        map
     };
 }
 
@@ -504,7 +498,7 @@ struct SignalEvent {
     eval_horizon_sec: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TopRow {
     ts: i64,
     pair: String,
@@ -567,6 +561,14 @@ struct BacktestResult {
     max_losing_streak: usize,
 
     equity_curve: Vec<f64>,
+}
+
+// NIEUW: Stars History voor tabblad Stars
+const STARS_HISTORY_FILE: &str = "stars_history.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StarsHistory {
+    history: Vec<TopRow>,
 }
 
 // ============================================================================
@@ -734,6 +736,7 @@ trades: Arc<DashMap<String, TradeState>>,
 
     manual_trader: Arc<Mutex<ManualTraderState>>, 
     news_sentiment: Arc<DashMap<String, (f64, i64, String)>>,
+    stars_history: Arc<Mutex<StarsHistory>>,
 }
 
 impl Engine {
@@ -748,6 +751,7 @@ impl Engine {
             weights: Arc::new(Mutex::new(ScoreWeights::default())),
             manual_trader: Arc::new(Mutex::new(ManualTraderState::new())),
             news_sentiment: Arc::new(DashMap::new()),
+            stars_history: Arc::new(Mutex::new(StarsHistory { history: Vec::new() })),
         }
     }
 
@@ -780,6 +784,39 @@ impl Engine {
                 ts.last_score *= 0.95;  // Lichte penalty voor negatief
             }
         }
+    }
+
+    // NIEUW: Add to stars history
+    fn add_to_stars_history(&self, row: TopRow) {
+        let mut history = self.stars_history.lock().unwrap();
+        history.history.push(row);
+        // Keep only last 1000 for memory
+        if history.history.len() > 1000 {
+            history.history.remove(0);
+        }
+    }
+
+    async fn save_stars_history(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let history = self.stars_history.lock().unwrap();
+        let json = serde_json::to_string_pretty(&*history)?;
+        tokio::fs::write(STARS_HISTORY_FILE, json).await?;
+        Ok(())
+    }
+
+    async fn load_stars_history(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match tokio::fs::read_to_string(STARS_HISTORY_FILE).await {
+            Ok(content) => {
+                match serde_json::from_str(&content) {
+                    Ok(h) => {
+                        let mut history = self.stars_history.lock().unwrap();
+                        *history = h;
+                    }
+                    Err(_) => {}
+                }
+            }
+            Err(_) => {}
+        }
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
@@ -2531,6 +2568,17 @@ tr:nth-child(even){ background:#252525; }
       </thead>
       <tbody></tbody>
     </table>
+    <h2>Historie</h2>
+    <table id="stars-history-table">
+      <thead>
+        <tr>
+          <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
+          <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
+          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Visuals</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </div>
 
   <div id="view-news" style="display:none;">
@@ -3592,6 +3640,8 @@ function tick() {
     loadBacktest();
   } else if (activeTab === "news") {
     loadNews();
+  } else if (activeTab === "stars") {
+    loadStars();
   }
 }
 
@@ -4189,6 +4239,16 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             warp::reply::json(&news_data)
         });
 
+    // NIEUW: API voor stars historie
+    let api_stars_history = warp::path!("api" / "stars_history")
+        .and(engine_filter.clone())
+        .map(|engine: Engine| {
+            let history = engine.stars_history.lock().unwrap();
+            let mut sorted_history = history.history.clone();
+            sorted_history.sort_by(|a, b| b.ts.cmp(&a.ts));
+            warp::reply::json(&sorted_history)
+        });
+
     let api_manual_trade_post = warp::path!("api" / "manual_trade")
         .and(warp::post())
         .and(warp::body::json())
@@ -4228,6 +4288,7 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
         .or(api_config_post)
         .or(api_config_reset)
         .or(api_news)
+        .or(api_stars_history)
         .or(index);
 
     let mut port: u16 = 8080;
@@ -4314,7 +4375,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load manual trader state from JSON
     engine.load_manual_trader().await;
     println!("Loaded manual trader state");
-    
+
+    // Load stars history
+    engine.load_stars_history().await;
+    println!("Loaded stars history");
+
     let engine_for_ws = engine.clone();
 
     // Clone chunks for orderbook workers
