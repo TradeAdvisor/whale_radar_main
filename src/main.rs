@@ -570,12 +570,12 @@ struct BacktestResult {
 }
 
 // ============================================================================
-// HOOFDSTUK 5 – MANUAL TRADING MODULE
+// HOOFDSTUK 5 – MANUAL TRADING MODULE (AANGEPAST)
 // ============================================================================
 
 const MANUAL_TRADES_FILE: &str = "manual_trades.json";
 const MANUAL_EQUITY_FILE: &str = "manual_trades_equity.json";
-const MANUAL_BASE_NOTIONAL: f64 = 100.0; // Base notional for manual trades
+const MANUAL_BASE_NOTIONAL: f64 = 100.0; // Fallback
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManualTrade {
@@ -585,6 +585,8 @@ struct ManualTrade {
     open_ts: i64,
     stop_loss: f64,
     take_profit: f64,
+    fee_pct: f64,  // NIEUW: Fee percentage voor verrekening bij close
+    manual_amount: f64,  // NIEUW: Handmatig ingevoerd bedrag voor trade
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -644,12 +646,12 @@ impl ManualTraderState {
         Ok(())
     }
 
-    fn add_trade(&mut self, pair: &str, price: f64, sl_pct: f64, tp_pct: f64) -> bool {
+    // AANGEPAST: Neem fee_pct en manual_amount mee
+    fn add_trade(&mut self, pair: &str, price: f64, sl_pct: f64, tp_pct: f64, fee_pct: f64, manual_amount: f64) -> bool {
         if self.trades.contains_key(pair) {
             return false; // Already have a position
         }
-        let notional = MANUAL_BASE_NOTIONAL;
-        let size = notional / price;
+        let size = manual_amount / price;  // Gebruik manual_amount in plaats van vaste base_notional
         let sl = price * (1.0 - sl_pct / 100.0);
         let tp = price * (1.0 + tp_pct / 100.0);
         let trade = ManualTrade {
@@ -659,27 +661,32 @@ impl ManualTraderState {
             open_ts: chrono::Utc::now().timestamp(),
             stop_loss: sl,
             take_profit: tp,
+            fee_pct,  // Opslaan
+            manual_amount,  // Opslaan
         };
         self.trades.insert(pair.to_string(), trade);
         println!(
-            "[MANUAL TRADE] OPEN {} at {:.5} size {:.5} SL={:.5} TP={:.5}",
-            pair, price, size, sl, tp
+            "[MANUAL TRADE] OPEN {} at {:.5} size {:.5} amount {:.2} SL={:.5} TP={:.5} fee={:.2}%",
+            pair, price, size, manual_amount, sl, tp, fee_pct
         );
         true
     }
 
+    // AANGEPAST: Verreken fee bij pnl
     fn close_trade(&mut self, pair: &str, exit_price: f64) -> bool {
         if let Some(trade) = self.trades.remove(pair) {
             let pnl = (exit_price - trade.entry_price) * trade.size;
-            self.balance += pnl;
+            let fee_amount = pnl.abs() * (trade.fee_pct / 100.0);  // Fee op basis van absoluut pnl
+            let net_pnl = pnl - fee_amount;  // Trek fee af
+            self.balance += net_pnl;
             let now = chrono::Utc::now().timestamp();
             self.equity_curve.push((now, self.balance));
             if self.equity_curve.len() > 365 {
                 self.equity_curve.remove(0);
             }
             println!(
-                "[MANUAL TRADE] CLOSED {} at {:.5} PnL={:.2}",
-                pair, exit_price, pnl
+                "[MANUAL TRADE] CLOSED {} at {:.5} Gross PnL={:.2} Fee={:.2} Net PnL={:.2}",
+                pair, exit_price, pnl, fee_amount, net_pnl
             );
             true
         } else {
@@ -699,6 +706,8 @@ struct ManualTradeView {
     current_price: f64,
     pnl_abs: f64,
     pnl_pct: f64,
+    fee_pct: f64,  // NIEUW: Voor display
+    manual_amount: f64,  // NIEUW: Voor display
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1908,6 +1917,8 @@ fn snapshot(&self) -> Vec<Row> {
                 current_price,
                 pnl_abs: pnl,
                 pnl_pct,
+                fee_pct: trade.fee_pct,  // NIEUW
+                manual_amount: trade.manual_amount,  // NIEUW
             });
         }
         ManualTradesResponse {
@@ -2115,14 +2126,14 @@ fn snapshot(&self) -> Vec<Row> {
     }
 
     // NIEUW: Handmatige buy
-    async fn manual_add_trade(&self, pair: &str, sl_pct: f64, tp_pct: f64) -> bool {
+    async fn manual_add_trade(&self, pair: &str, sl_pct: f64, tp_pct: f64, fee_pct: f64, manual_amount: f64) -> bool {
         let current_price = self.candles.get(pair).and_then(|c| c.close).unwrap_or(0.0);
         if current_price <= 0.0 {
             return false;
         }
         let (success, state_clone) = {
             let mut trader = self.manual_trader.lock().unwrap();
-            let success = trader.add_trade(pair, current_price, sl_pct, tp_pct);
+            let success = trader.add_trade(pair, current_price, sl_pct, tp_pct, fee_pct, manual_amount);
             (success, trader.clone())
         };
         if success {
@@ -2190,7 +2201,7 @@ fn normalize_pair(wsname: &str) -> String {
 }
 
 // ============================================================================
-// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD)
+// HOOFDSTUK 9 – FRONTEND (HTML DASHBOARD) (AANGEPAST)
 // ============================================================================
 
 
@@ -2374,7 +2385,7 @@ tr:nth-child(even){ background:#252525; }
         <tr>
           <th>Time</th><th>Pair</th><th>Price</th><th>%</th><th>Flow</th><th>Dir</th>
           <th>Early</th><th>Alpha</th><th>Whale</th><th>Total score</th><th>Pump</th>
-          <th>WhPred</th><th>Rel</th><th>Type</th><th>Visual</th><th>Analyse</th>
+          <th>WhPred</th><th>Rel</th><th>Visual</th><th>Analyse</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -2396,6 +2407,15 @@ tr:nth-child(even){ background:#252525; }
       <select id="manual-pair" style="width:200px; margin-left:10px;">
         <!-- Vul dynamisch met pairs -->
       </select>
+      <br/><br/>
+      <label style="margin-right:10px;">Fee %:</label>
+      <select id="manual-fee">
+        <option value="0.1">0.1%</option>
+        <option value="0.26" selected>0.26%</option>
+        <option value="0.5">0.5%</option>
+      </select>
+      <label style="margin-left:20px; margin-right:10px;">Amount (€):</label>
+      <input type="number" id="manual-amount" value="100" step="10" style="width:100px;" />
       <br/><br/>
       <label style="margin-right:10px;">Stop Loss %:</label>
       <select id="manual-sl">
@@ -2425,6 +2445,8 @@ tr:nth-child(even){ background:#252525; }
           <th>PnL Abs</th>
           <th>PnL %</th>
           <th>Open TS</th>
+          <th>Fee %</th>
+          <th>Amount</th>
           <th>Actions</th>
         </tr>
       </thead>
@@ -2640,6 +2662,8 @@ let activeTab = "markets";
 
 let heatmapPoints = [];
 let heatTooltip = null;
+let manualTradePairs = [];
+let manualTradeSearchInitialized = false;
 
 const stablecoins = ["USDT", "USDC", "TUSD", "BUSD", "DAI", "UST", "FRAX", "LUSD"];
 
@@ -2949,29 +2973,23 @@ async function loadManualTrades() {
   document.getElementById("manual-pnl").textContent = `€${totalPnl.toFixed(2)}`;
   document.getElementById("manual-pnl").className = totalPnl > 0 ? 'pos' : (totalPnl < 0 ? 'neg' : '');
 
-  // Populate pair dropdown with search functionality
-  let pairs = await fetch("/api/stats").then(r => r.json()).then(d => d.map(r => r.pair));
-  let select = document.getElementById("manual-pair");
-  select.innerHTML = "";
-  pairs.forEach(p => {
-    let opt = document.createElement("option");
-    opt.value = p;
-    opt.text = p;
-    select.appendChild(opt);
-  });
+  // Update global pairs list
+  manualTradePairs = await fetch("/api/stats").then(r => r.json()).then(d => d.map(r => r.pair));
   
-  // Add search filter for pairs
-  let searchInput = document.getElementById("manual-pair-search");
-  searchInput.addEventListener("input", () => {
-    let query = searchInput.value.toLowerCase();
-    select.innerHTML = "";
-    pairs.filter(p => p.toLowerCase().includes(query)).forEach(p => {
-      let opt = document.createElement("option");
-      opt.value = p;
-      opt.text = p;
-      select.appendChild(opt);
-    });
-  });
+  // Initialize search filter once
+  if (!manualTradeSearchInitialized) {
+    let searchInput = document.getElementById("manual-pair-search");
+    if (searchInput) {
+      searchInput.addEventListener("input", () => {
+        filterManualTradePairs();
+      });
+    }
+    // Set flag to true regardless to avoid repeated DOM queries
+    manualTradeSearchInitialized = true;
+  }
+  
+  // Apply current filter to update dropdown
+  filterManualTradePairs();
 
   // Display active trades
   let tbody = document.querySelector("#manual-trades-table tbody");
@@ -2986,6 +3004,8 @@ async function loadManualTrades() {
         <td class="${trade.pnl_abs > 0 ? 'pos' : 'neg'}">€${trade.pnl_abs.toFixed(2)}</td>
         <td class="${trade.pnl_pct > 0 ? 'pos' : 'neg'}">${trade.pnl_pct.toFixed(2)}%</td>
         <td>${new Date(trade.open_ts * 1000).toLocaleString()}</td>
+        <td>${trade.fee_pct.toFixed(2)}%</td>
+        <td>€${trade.manual_amount.toFixed(2)}</td>
         <td><button onclick="closeManualTrade('${trade.pair}')" style="padding:3px 8px;">Close</button></td>
       </tr>
     `;
@@ -2996,12 +3016,32 @@ async function loadManualTrades() {
   drawManualEquity(equity);
 }
 
+function filterManualTradePairs() {
+  let searchInput = document.getElementById("manual-pair-search");
+  let select = document.getElementById("manual-pair");
+  
+  if (!searchInput || !select) return;
+  
+  let query = searchInput.value.toLowerCase();
+  let filtered = manualTradePairs.filter(p => p.toLowerCase().includes(query));
+  
+  select.innerHTML = "";
+  filtered.forEach(p => {
+    let opt = document.createElement("option");
+    opt.value = p;
+    opt.text = p;
+    select.appendChild(opt);
+  });
+}
+
 // Event listener for Open Trade button
 window.addEventListener("load", () => {
   document.getElementById("manual-open-btn").addEventListener("click", async () => {
     let pair = document.getElementById("manual-pair").value;
     let sl_pct = parseFloat(document.getElementById("manual-sl").value);
     let tp_pct = parseFloat(document.getElementById("manual-tp").value);
+    let fee_pct = parseFloat(document.getElementById("manual-fee").value);
+    let manual_amount = parseFloat(document.getElementById("manual-amount").value);
     
     if (!pair) {
       alert("Please select a pair!");
@@ -3011,7 +3051,7 @@ window.addEventListener("load", () => {
     let res = await fetch("/api/manual_trade", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({pair, sl_pct, tp_pct})
+      body: JSON.stringify({pair, sl_pct, tp_pct, fee_pct, manual_amount})
     });
     let result = await res.json();
     if (result.success) {
@@ -3141,9 +3181,10 @@ function drawEquityCurve(result) {
   ctx.strokeStyle = "#444";
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.moveTo(padding, padding + h);
-  ctx.lineTo(padding, padding);
-  ctx.lineTo(padding + w, padding);
+  ctx.moveTo(padding, h - 30);
+  ctx.lineTo(w - 10, h - 30);
+  ctx.moveTo(40, 10);
+  ctx.lineTo(40, h - 30);
   ctx.stroke();
 
   ctx.strokeStyle = "#00e676";
@@ -4156,7 +4197,9 @@ async fn run_http(engine: Engine, config: Arc<Mutex<AppConfig>>) {
             let pair = body["pair"].as_str().unwrap_or("");
             let sl_pct = body["sl_pct"].as_f64().unwrap_or(2.0);
             let tp_pct = body["tp_pct"].as_f64().unwrap_or(5.0);
-            let success = engine.manual_add_trade(pair, sl_pct, tp_pct).await;
+            let fee_pct = body["fee_pct"].as_f64().unwrap_or(0.26);
+            let manual_amount = body["manual_amount"].as_f64().unwrap_or(100.0);
+            let success = engine.manual_add_trade(pair, sl_pct, tp_pct, fee_pct, manual_amount).await;
             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"success": success})))
         });
 
